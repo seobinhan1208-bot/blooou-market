@@ -1,7 +1,8 @@
-PASTER STARTS HEREimport os
+import os
 import json
 import time
 import random
+import requests
 from flask import Flask, request, jsonify, Response, redirect, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -19,6 +20,8 @@ ORDERS_FILE = f"{DATA_DIR}/orders.json"
 
 ADMIN_EMAIL = os.environ.get("MARKET_ADMIN_EMAIL", "owner@blooou.com")
 PAYMENT_LINK = os.environ.get("MARKET_PAYMENT_LINK", "")   # set once a real payment processor is connected
+KICKSDB_API_KEY = os.environ.get("KICKSDB_API_KEY", "")
+KICKSDB_BASE = "https://api.kicks.dev/v3"
 
 def _atomic_write(path, data):
     tmp = path + ".tmp"
@@ -74,6 +77,52 @@ def seed_shoes():
     save_shoes({s["id"]: s for s in seed})
 
 seed_shoes()
+
+_PRICE_CACHE = {}          # sid -> {"price": float, "history": [...], "fetched": ts}
+_PRICE_CACHE_TTL = 600     # 10 minutes, keeps this well under any reasonable rate limit
+
+def fetch_live_price(shoe_name, fallback_price, fallback_history):
+    """Pull a real current price from KicksDB if a key is configured, falling back to
+    the seeded price on any error, timeout, missing key, or unexpected response shape.
+    This never raises, worst case the site just shows the same numbers it always did."""
+    if not KICKSDB_API_KEY:
+        return fallback_price, fallback_history
+    cached = _PRICE_CACHE.get(shoe_name)
+    if cached and time.time() - cached["fetched"] < _PRICE_CACHE_TTL:
+        return cached["price"], cached["history"]
+    try:
+        headers = {"Authorization": KICKSDB_API_KEY}
+        search = requests.get(f"{KICKSDB_BASE}/search", params={"query": shoe_name},
+                               headers=headers, timeout=6)
+        search.raise_for_status()
+        results = search.json().get("data", [])
+        if not results:
+            return fallback_price, fallback_history
+        product_id = results[0].get("id") or results[0].get("slug")
+        if not product_id:
+            return fallback_price, fallback_history
+        sales = requests.get(f"{KICKSDB_BASE}/stockx/products/{product_id}/sales/daily",
+                              headers=headers, params={"limit": 6}, timeout=6)
+        sales.raise_for_status()
+        rows = sales.json().get("data", [])
+        history = [r["amount"] for r in reversed(rows) if r.get("amount")]
+        if not history:
+            return fallback_price, fallback_history
+        price = history[-1]
+        _PRICE_CACHE[shoe_name] = {"price": price, "history": history, "fetched": time.time()}
+        return price, history
+    except Exception as e:
+        print(f"[kicksdb] live price fetch failed for '{shoe_name}', using fallback: {e}")
+        return fallback_price, fallback_history
+
+def shoes_with_live_prices():
+    """The seeded shoe catalog, with prices refreshed from KicksDB where possible."""
+    shoes = load_shoes()
+    out = {}
+    for sid, s in shoes.items():
+        price, history = fetch_live_price(s["name"], s["price"], s["history"])
+        out[sid] = {**s, "price": price, "history": history}
+    return out
 
 STYLE = """<style>
   *{box-sizing:border-box;-webkit-font-smoothing:antialiased}
@@ -161,7 +210,7 @@ def shoe_card(sid, s):
 
 @app.get("/")
 def home():
-    shoes = load_shoes()
+    shoes = shoes_with_live_prices()
     cards = "".join(shoe_card(sid, s) for sid, s in shoes.items())
     body = f"""<div class="subnav">
       <span class="on">All</span><span>Trending</span><span>Jordan</span><span>Nike</span><span>New Balance</span>
@@ -174,7 +223,7 @@ def home():
 
 @app.get("/shoe/<sid>")
 def shoe_detail(sid):
-    shoes = load_shoes()
+    shoes = shoes_with_live_prices()
     s = shoes.get(sid)
     if not s:
         return redirect("/")
@@ -313,14 +362,6 @@ def checkout_page(sid):
       {pay_button}
     </div>"""
     return page("Checkout", body)
-
-if __name__ == "__main__":
-    print("")
-    print("  blooou marketplace is starting up...")
-    print("  open this in your browser: http://127.0.0.1:5000")
-    print("  press Ctrl+C in this window to stop it")
-    print("")
-    app.run(host="127.0.0.1", port=5000, debug=True)
 
 @app.get("/signin")
 def signin_page():
@@ -567,4 +608,12 @@ def admin_approve(lid):
         if l["id"] == lid:
             l["status"] = "live"
     save_listings(listings)
-    return redirect("/admin")PASTE ENDS HERE
+    return redirect("/admin")
+
+if __name__ == "__main__":
+    print("")
+    print("  blooou marketplace is starting up...")
+    print("  open this in your browser: http://127.0.0.1:5000")
+    print("  press Ctrl+C in this window to stop it")
+    print("")
+    app.run(host="127.0.0.1", port=5000, debug=True)
